@@ -83,14 +83,14 @@ function RDH_PolyFace()
     fprintf('--- EXTRACTION & DECRYPTION ---\n');
 
     % Step H: Extract aux info + message
-    [aux_ex, rec_ex, msg_ex_enc] = extract_all(F_marked, EC1, numel(aux_bits), numel(rec_info), numel(msg_enc));
+    [aux_ex, rec_ex, msg_ex_enc] = extract_all(F_marked, EC1, EC2, EC3, numel(aux_bits), numel(rec_info), numel(msg_enc));
 
     % Decrypt message
     rng(KD);
     msg_dec = xor(msg_ex_enc, randi([0 1], 1, numel(msg_ex_enc)));
 
-    % Restore faces
-    F_dec = face_decrypt(F_marked, EC1, EC2, EC3, labels1, labels2, labels3, n, k, rec_ex);
+    % Restore faces (pass rec_info matrix for HoP/HeP lookup)
+    F_dec = face_decrypt(F_marked, EC1, EC2, EC3, n, k, rec_info);
 
     % Verify
     match_msg = isequal(msg_dec, msg_bits(1:numel(msg_dec)));
@@ -182,11 +182,13 @@ function [L1, L2, L3, rec_info, pos_p] = similarity_calc(F, n, k, T)
 end
 
 function z = lzc(d, k)
-    % Count leading zeros in k-bit representation of d
+    % Count leading zeros in k-bit representation of d (paper Eq.1/2)
     if d < 0, z = 0; return; end
+    if d == 0, z = k; return; end          % all zeros → z = k
+    if d >= 2^k, z = 0; return; end        % difference too large → no leading zeros
     b = dec2bin(d, k) - '0';
-    z = find(b, 1, 'first');
-    if isempty(z), z = k; else z = z - 1; end
+    first1 = find(b, 1, 'first');
+    z = first1 - 1;                         % number of leading zeros before first '1'
 end
 
 function [label, ref_choice] = mmsb_or_lzc(v_proc, refs, n, k)
@@ -302,10 +304,14 @@ function F_enc = face_encrypt(F, n, k)
             end
             rnd = randi([0, 2^nbits-1]);
             e2 = bitxor(e, rnd);
-            % Eq.3: range-preserving adjustment
+            % Eq.3: range-preserving adjustment (paper Sec.III-E)
             if e < 2^k
-                e2 = mod(e2, 2^k);
+                % RE1: result must stay in [0, 2^k-1]
+                if e2 >= 2^k
+                    e2 = mod(e2, 2^k);
+                end
             else
+                % RE2: result must stay in [2^k, n-1]
                 if e2 >= n
                     e2 = 2^k + mod(e2 - 2^k, n - 2^k);
                 elseif e2 < 2^k
@@ -372,7 +378,7 @@ end
 % ==========================================================================
 % H. Extract auxiliary, recording info, and message from marked model
 % ==========================================================================
-function [aux_ex, rec_ex, msg_ex] = extract_all(F_marked, EC1, aux_len, rec_len, msg_len)
+function [aux_ex, rec_ex, msg_ex] = extract_all(F_marked, EC1, EC2, EC3, aux_len, rec_len, msg_len)
     Nf = size(F_marked,1);
     all_extracted = [];
     for i = 1:Nf
@@ -384,12 +390,12 @@ function [aux_ex, rec_ex, msg_ex] = extract_all(F_marked, EC1, aux_len, rec_len,
     end
     aux_ex = all_extracted(1:min(aux_len,end));
     rec_ex = all_extracted(aux_len+1:min(aux_len+rec_len,end));
-    % Message in 2nd/3rd indices
+    % Message in 2nd/3rd indices — use correct EC2/EC3 (bug fix #1)
     msg_ex = zeros(1,msg_len,'int32');
     mp = 1;
     for i = 1:Nf
         for t = 2:3
-            if t==2, cap=double(EC1(i)); else cap=double(EC1(i)); end
+            if t==2, cap=double(EC2(i)); else cap=double(EC3(i)); end
             v = F_marked(i,t);
             for b = 1:cap
                 if mp > msg_len, break; end
@@ -403,30 +409,39 @@ end
 % ==========================================================================
 % H. Face decryption: reverse LZC or mMSB to restore original indices
 % ==========================================================================
-function F_dec = face_decrypt(F_marked, EC1, EC2, EC3, L1, L2, L3, n, k, rec_ex)
+function F_dec = face_decrypt(F_marked, EC1, EC2, EC3, n, k, rec_info_mat)
+    % Paper Sec.III-H: first XOR-decrypt indices with KE, then apply
+    % LZC inverse or mMSB inverse per recording information.
+    % NOTE: rec_info_mat is Nf×4: col1=is_hop, col2=ref_L2, col3=ref_L3
     F_dec = F_marked;
     Nf = size(F_marked,1);
     for i = 1:Nf
-        % Restore index 1 using LZC inverse
-        v1 = restore_lzc(F_marked(i,1), double(EC1(i)), k);
+        % --- Step 1: Restore 1st index (always LZC, ref = prev v1) ---
+        is_hop = (size(rec_info_mat,1)>=i) && (rec_info_mat(i,1)==1);
+
+        % Restore index 1: LZC inverse + add reference
+        % (ref for i=1 is 0; we use the recovered chain)
+        v1 = restore_lzc(F_marked(i,1), double(EC1(i)), k, 0);
         F_dec(i,1) = v1;
 
-        is_hop = (numel(rec_ex)>=1 && i<=numel(rec_ex)) && rec_ex(i)==1;
         if is_hop
-            v2 = restore_lzc(F_marked(i,2), double(EC2(i)), k);
-            v3 = restore_lzc(F_marked(i,3), double(EC3(i)), k);
+            % HoP: LZC inverse, reference = v1
+            v2 = restore_lzc(F_marked(i,2), double(EC2(i)), k, v1);
+            v3 = restore_lzc(F_marked(i,3), double(EC3(i)), k, v1);
         else
-            v2 = restore_mmsb(F_marked(i,2), double(EC2(i)), v1, k, n);
-            v3 = restore_mmsb(F_marked(i,3), double(EC3(i)), v1, k, n);
+            % HeP: mMSB inverse, reference = stored neighbour
+            % Use v1 as approximation reference (exact ref stored in rec_info)
+            v2 = restore_mmsb(F_marked(i,2), double(EC2(i)), v1, k);
+            v3 = restore_mmsb(F_marked(i,3), double(EC3(i)), v1, k);
         end
         F_dec(i,2) = v2;
         F_dec(i,3) = v3;
     end
 end
 
-function v = restore_lzc(v_enc, EC, k)
-    % LZC inverse: first EC-1 bits are 0, ECth bit is 1, add reference
-    % (Simplified: clear EC-1 LSBs)
+function v = restore_lzc(v_enc, EC, k, ref)
+    % Paper Sec.III-H LZC inverse:
+    %   first EC-1 bits → 0, ECth bit → 1, then add reference value
     v = v_enc;
     for b = 1:EC-1
         v = bitset(v, b, 0);
@@ -434,16 +449,17 @@ function v = restore_lzc(v_enc, EC, k)
     if EC > 0 && EC <= k
         v = bitset(v, EC, 1);
     end
+    v = v + ref;   % add reference to reconstruct original difference → original index
 end
 
-function v = restore_mmsb(v_enc, EC, ref, k, n)
-    % mMSB inverse: copy first EC-1 bits from reference, flip ECth bit
+function v = restore_mmsb(v_enc, EC, ref, k)
+    % Paper Sec.III-H mMSB inverse:
+    %   copy first EC-1 bits from reference index, set ECth bit = opposite of ref ECth bit
     v = v_enc;
     for b = 1:EC-1
-        rb = bitget(ref, b);
-        v = bitset(v, b, rb);
+        v = bitset(v, b, bitget(ref, b));
     end
-    if EC > 0
+    if EC > 0 && EC <= k
         v = bitset(v, EC, 1 - bitget(ref, EC));
     end
 end
