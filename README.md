@@ -6,127 +6,173 @@
 
 ---
 
-## ⚠️ Important Scope Note
+## ⚠️ Scope
 
 > This paper operates on **3D mesh polygon indices** — NOT on images.
-> - ❌ Hyperspectral images — **not applicable**
-> - ❌ 12-bit / HDR images — **not applicable**
+> - ❌ Hyperspectral / 12-bit images — **not applicable**
 > - ✅ Triangular/polygonal 3D model face index values (OBJ / PLY format)
 >
-> "Intensity shifting" in this context refers to **index value shifting** of vertex indices
-> within each polygonal face — analogous to histogram shifting in image RDH but operating
-> on the discrete vertex-index space of a 3D mesh.
+> *"Intensity shifting"* here means **vertex-index value shifting** — analogous to histogram shifting in image RDH but on the discrete vertex-index space of a 3D mesh.
 
 ---
 
-## Pipeline Diagram (with Equations)
+## Full Pipeline Diagram (with Equations at Every Step)
 
 ```mermaid
-flowchart TD
-    A["🔷 INPUT\n3D Mesh: Vertices V, Faces F\nKeys: KE (encrypt), KD (message)\nThreshold T, k = ⌈log₂n⌉"]
+graph TD
 
-    A --> B["STEP A — Right Circular Shifting\ncircshift(F_i) so min(F_i) → position 1\nPreserves polygon normal vector\n📐 No equation — cyclic permutation"]
+    %% ─────────────────────────────────────────────────────────
+    subgraph ING["1.  INPUT  —  3D Mesh + Keys"]
+        MESH["📐 3D Mesh  (OBJ / PLY format)\n\nVertices V  (unchanged throughout)\nFaces    F  (n×3 integer matrix)\nVertex count = n  →  indices 0 … n−1\n\nKeys:  KE (face encryption seed)\n       KD (message encryption seed)\nThreshold T  (HoP/HeP boundary)"]
+        PARAMS["📊 Key Parameter\n\nk = ⌊log₂ n⌋          ← FLOOR (not ceil)\n\nRE1 = [ 0 ,  2ᵏ−1 ]   low  region\nRE2 = [ 2ᵏ,  n−1  ]   high region\n\nExample: n=200 → k=7\n  RE1 = [0, 127]   RE2 = [128, 199]"]
+    end
 
-    B --> C{"STEP B — Classify Each Face\nDᵢ = max(F'ᵢ) − min(F'ᵢ)"}
+    %% ─────────────────────────────────────────────────────────
+    subgraph RCS["2.  Step A  —  Right Circular Shifting  (Sec.III-B)"]
+        RCSA["🔄 RCS Reorder\n\nFor each face i:\n  pos = argmin( F[i,:] )\n  F'[i,:] = circshift( F[i,:], −(pos−1) )\n\nResult: F'[i,1] = min index of face i\n        (smallest index always first)\n\n⚠ Normal vector direction preserved\n  by cyclic shift (not full sort)"]
+    end
 
-    C -->|"Dᵢ ≤ T AND\nsame binary region"| HoP["HoP Face\n(Homogeneous Polygon)\nIndices are close together"]
-    C -->|"else"| HeP["HeP Face\n(Heterogeneous Polygon)\nIndices are spread out"]
+    %% ─────────────────────────────────────────────────────────
+    subgraph SIM["3.  Step B/C  —  Similarity Calculation  (Sec.III-C/D)"]
+        CLASS{"🔀 HoP / HeP Classification\n\nDᵢ = max(F'ᵢ) − min(F'ᵢ)\nsame_region = ALL in RE1 OR ALL in RE2\n\nHoP  if  Dᵢ ≤ T  AND  same_region\nHeP  otherwise"}
 
-    HoP --> L1H["STEP C — LZC Labels (HoP)\n📌 Eq.1: L¹ᵢ = LZC(v'¹ᵢ − v'¹ᵢ₋₁)\n📌 Eq.2: L²ᵢ = LZC(v'²ᵢ − v'¹ᵢ)\n📌 Eq.2: L³ᵢ = LZC(v'³ᵢ − v'¹ᵢ)\nLabel = number of leading zeros in difference"]
+        HOP["✅ HoP  (Homogeneous Polygon)\n\n📌 Eq. 1  (1st index, all faces):\n  L¹ᵢ = LZC( v'¹ᵢ − ref¹ᵢ )\n\n  where ref¹ᵢ =\n    0        if i = 1\n    2ᵏ       if i = p  (first RE2 face)\n    v'¹ᵢ₋₁  otherwise\n\n📌 Eq. 2  (2nd and 3rd index, HoP only):\n  L²ᵢ = LZC( v'²ᵢ − v'¹ᵢ )\n  L³ᵢ = LZC( v'³ᵢ − v'¹ᵢ )\n\n  LZC = leading-zero count in k-bit MSB-first\n  representation of the non-negative difference"]
 
-    HeP --> L1E["STEP C — LZC + mMSB Labels (HeP)\n📌 Eq.1: L¹ᵢ = LZC(v'¹ᵢ − v'¹ᵢ₋₁)\n4 reference neighbours for L², L³\nIf v_proc ≥ v_ref → LZC\nIf v_proc < v_ref  → mMSB\nLabel = max over 4 neighbours"]
+        HEP["⚡ HeP  (Heterogeneous Polygon)\n\n📌 Eq. 1  (1st index) — same as HoP\n\n4-Neighbour Prediction  (Fig.3):\n  Candidates for v'²ᵢ: [pv1, pv2, pv3, v'¹ᵢ]\n  Candidates for v'³ᵢ: [v'¹ᵢ, v'²ᵢ, pv1, pv2]\n\n  For each candidate ref_r (same region only):\n    if v'ᵗᵢ ≥ ref_r → LZC( v'ᵗᵢ − ref_r )\n    if v'ᵗᵢ <  ref_r → mMSB( v'ᵗᵢ, ref_r )\n\n  mMSB = count of matching MSBs between v and ref\n  Best label (max) wins → pred_type + win_ref stored"]
 
-    L1H --> EC["📌 Embedding Capacity Formula\nECᵗᵢ = min(k, Lᵗᵢ + 1)\n(L+1)-th bit is always '1'\n→ first L bits are freely modifiable"]
-    L1E --> EC
+        EC["📌 Embedding Capacity\n\n  ECᵗᵢ = min( k,  Lᵗᵢ + 1 )\n\n  Positions 1…Lᵗᵢ  (paper MSB-first)  = FREE\n  Position   Lᵗᵢ+1                    = structural '1'\n\n  MATLAB bit mapping:\n  Paper pos p  ↔  MATLAB bit  k−p+1\n  (position 1 = MSB = MATLAB bit k)\n\n  L=0 case: EC=1, zero free bits → index not transformed"]
+    end
 
-    EC --> HHE["STEP D — Hybrid Huffman Encoding\nTree₁  → encodes L¹ labels (1st index)\nTree₂₃ → encodes L², L³ labels (2nd+3rd)\nOutputs: compressed aux_bits stream"]
+    %% ─────────────────────────────────────────────────────────
+    subgraph HHE["4.  Step D  —  Hybrid Huffman Encoding  (Sec.III-E)"]
+        HUFF["🗜 Huffman Compression of Labels\n\n  Tree₁  → encodes {L¹ᵢ}  (1st-index labels)\n  Tree₂₃ → encodes {L²ᵢ, L³ᵢ}  (2nd+3rd)\n\n  aux_bits = [ serialize(Tree₁)\n             | huffmanenco(L¹)\n             | serialize(Tree₂₃)\n             | huffmanenco(L², L³) ]\n\n  Receiver uses aux_bits to reconstruct\n  all L values and hence all EC values\n  before any decryption is attempted"]
+    end
 
-    HHE --> ENC["STEP E — Face Encryption\n📌 Eq.3 (Range-Preserving XOR)\ne' = XOR(e, KE_stream)\nIf e' out of range → modular wrap:\n  e' = 2ᵏ + (e'−2ᵏ) mod (n−2ᵏ)  if e≥n\n  e' = 2ᵏ + (e'+2ᵏ) mod (n−2ᵏ)  if e<2ᵏ\nKeeps encrypted index in same region"]
+    %% ─────────────────────────────────────────────────────────
+    subgraph EMBD["5.  Step E+F+G  —  Pre-transform → Embed → Encrypt  (Sec.III-F/G/H)"]
+        KD_STEP["🔑 KD Pre-encryption  (BEFORE KE seed set)\n\n  rng(KD)\n  kd_stream = rand_bits(|msg|)\n  msg_enc   = msg XOR kd_stream\n\n  ⚠ Critical order: KD stream must be generated\n  BEFORE rng(KE) is called, otherwise the KE\n  face-encryption stream would be contaminated"]
 
-    ENC --> AUX["STEP F — Auxiliary Info Embedding\nEmbed into 1st-index bits (vertical order)\nContent: [Tree₁ | Tree₂₃ | labels | pos p | rec_info]\nEC¹ᵢ bits used per face\n📌 1st index always has highest EC → guaranteed space"]
+        PAYLOAD["📦 Payload Assembly\n\n  payload = [ aux_bits | rec_flat | msg_enc ]\n\n  rec_flat = flatten( rec_info[:,1:3] )\n           = 3 bits × Nf  (is_hop, pred_L2, pred_L3)\n\n  Total payload embedded into face index bits"]
 
-    AUX --> MSG["STEP G — Message Hiding\nXOR msg with KD stream → msg_enc\nEmbed msg_enc into 2nd + 3rd index bits\nEC²ᵢ + EC³ᵢ bits per face\nTotal capacity ≈ 32.63 bpp"]
+        PRETRANS["🔀 Pre-encrypt Transform  (per face, per index t)\n\n  if pred = LZC  AND  Lᵗᵢ > 0:\n    e_val = v'ᵗᵢ − refᵗᵢ   ← difference d  (≥ 0)\n    d is always in RE1  [0, 2ᵏ−1]\n\n  if pred = LZC  AND  Lᵗᵢ = 0  (no leading zeros):\n    e_val = v'ᵗᵢ             ← no transform\n\n  if pred = mMSB:\n    e_val = v'ᵗᵢ             ← no transform"]
 
-    MSG --> OUT["🔶 OUTPUT\nF_marked: Encrypted + Embedded 3D Model\nVertex positions UNCHANGED\nOnly polygon index values modified"]
+        EMBED["✍ Embed Payload into Leading-Zero Positions\n\n  for b_paper = 1 … Lᵗᵢ:\n    MATLAB bit = k − b_paper + 1\n    e_val ← set_bit( e_val, b_paper, payload[ptr++] )\n\n  Structural bit  (only if Lᵗᵢ > 0):\n    set_bit( e_val, Lᵗᵢ+1, 1 )   ← anchor '1'"]
 
-    OUT --> REC["── RECEIVER ──\nSTEP H — Extraction + Decryption\n1. Read aux bits from 1st-index positions\n2. Decode Huffman → recover EC values\n3. Decrypt message: XOR with KD stream\n4. Restore indices:\n   LZC path:  set bits 1..EC-1=0, ECth=1, +ref\n   mMSB path: copy bits 1..EC-1 from ref, flip ECth\n→ Original F' perfectly restored ✓"]
+        XOR_ENC["📌 Eq. 3  —  Range-Preserving XOR Encryption\n\n  nbits = k   if e_val < 2ᵏ  (RE1)\n  nbits = k+1 if e_val ≥ 2ᵏ  (RE2)\n\n  rnd_val = randi([0, 2ⁿᵇⁱᵗˢ − 1])  ← KE stream\n  e_enc   = e_val XOR rnd_val\n\n  Range-preserving adjustment:\n  if RE1 and e_enc ≥ 2ᵏ:\n    e_enc = e_enc mod 2ᵏ\n  if RE2 and e_enc ≥ n:\n    e_enc = 2ᵏ + (e_enc−2ᵏ) mod (n−2ᵏ)\n  if RE2 and e_enc < 2ᵏ:\n    e_enc = 2ᵏ + (e_enc+2ᵏ) mod (n−2ᵏ)\n\n  ✅ Encrypted index stays in same region as original"]
+
+        FOUT["🔶 OUTPUT: F_marked\n\nEncrypted + payload-embedded face matrix\nVertex positions UNCHANGED\nPolygon index values modified"]
+    end
+
+    %% ─────────────────────────────────────────────────────────
+    subgraph DEC["6.  Step H  —  Extraction + Decryption  (Sec.III-I)"]
+        XOR_DEC["🔓 XOR Decrypt  (same KE seed, same order)\n\n  rng(KE)   ← reset to same state as encryption\n\n  For each face i, index t  (same loop order):\n    nbits = k   if pred=LZC and L>0   (d in RE1)\n    nbits = k   if ref < 2ᵏ           (RE1 case)\n    nbits = k+1 if ref ≥ 2ᵏ           (RE2 case)\n\n    rnd_val = randi([0, 2ⁿᵇⁱᵗˢ − 1])  ← same value!\n    e_dec   = e_enc XOR rnd_val        ← XOR cancels ✓"]
+
+        EXTRACT["📤 Extract Payload Bits  (Step 2)\n\n  for b_paper = 1 … Lᵗᵢ:\n    payload_bit = get_bit( e_dec, b_paper )\n    all_payload.append( payload_bit )\n\n  After all faces: split all_payload into\n    aux_bits   → decode Huffman → recover L values\n    rec_flat   → recover pred types and refs\n    msg_enc    → KD-decrypt to recover message"]
+
+        RESTORE["🔁 Index Restoration  (Step 3+4)\n\n  Clear bits 1…L:   set_bit(e_dec, b, 0)  for b=1..L\n  Restore structural: set_bit(e_dec, L+1, 1)  if L>0\n\n  → e_dec is now the original pre-embedded value\n\n  if pred=LZC and L>0:\n    v_rec = e_dec + ref       ← d + ref = v  ✓\n\n  if pred=LZC and L=0  OR  pred=mMSB:\n    v_rec = e_dec             ← identity (no transform)\n\n  Clamp: v_rec = max(0, min(n−1, v_rec))"]
+
+        KD_DEC["🔑 KD Message Decryption\n\n  rng(KD)   ← called AFTER all XOR decrypt loops\n  kd_stream = rand_bits(|msg_enc|)\n  msg       = msg_enc XOR kd_stream  ← recovers original\n\n  ✅ Perfect reversibility:\n    F_dec == F_rcs  (original polygon indices)\n    msg_dec == msg  (original secret message)"]
+    end
+
+    %% ─────────────────────────────────────────────────────────
+    subgraph OUT["7.  OUTPUT / RESULTS"]
+        RES["✅ Verification\n\nMessage recovery:   PASS ✓\nFace restoration:   PASS ✓\nVertex positions:   UNCHANGED\n\nAvg capacity (T=10, 20 models): 32.63 bpp\nBest prior method (Sui [17]):   28.00 bpv\nImprovement:                    +16%"]
+    end
+
+    %% ─────────────────────────────────────────────────────────
+    %% Flow connections
+    MESH    --> PARAMS
+    PARAMS  --> RCSA
+
+    RCSA    --> CLASS
+    CLASS   -->|"Dᵢ ≤ T AND same region"| HOP
+    CLASS   -->|"else"| HEP
+    HOP     --> EC
+    HEP     --> EC
+    EC      --> HUFF
+
+    HUFF    --> KD_STEP
+    KD_STEP --> PAYLOAD
+    PAYLOAD --> PRETRANS
+    PRETRANS--> EMBED
+    EMBED   --> XOR_ENC
+    XOR_ENC --> FOUT
+
+    FOUT    --> XOR_DEC
+    XOR_DEC --> EXTRACT
+    EXTRACT --> RESTORE
+    RESTORE --> KD_DEC
+    KD_DEC  --> RES
+
+    ING --> RCS
+    RCS --> SIM
+    SIM --> HHE
+    HHE --> EMBD
+    EMBD --> DEC
+    DEC --> OUT
+
+    %% ─────────────────────────────────────────────────────────
+    %% Styles
+    style MESH      fill:#1e1e2e,stroke:#74c7ec,stroke-width:2px,color:#cdd6f4
+    style PARAMS    fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
+    style RCSA      fill:#1e1e2e,stroke:#fab387,stroke-width:2px,color:#cdd6f4
+    style CLASS     fill:#313244,stroke:#f9e2af,stroke-width:2px,color:#f9e2af
+    style HOP       fill:#1e1e2e,stroke:#a6e3a1,stroke-width:2px,color:#cdd6f4
+    style HEP       fill:#1e1e2e,stroke:#cba6f7,stroke-width:2px,color:#cdd6f4
+    style EC        fill:#1e1e2e,stroke:#89dceb,stroke-width:3px,color:#cdd6f4
+    style HUFF      fill:#1e1e2e,stroke:#fab387,stroke-width:2px,color:#cdd6f4
+    style KD_STEP   fill:#1e1e2e,stroke:#f38ba8,stroke-width:2px,color:#cdd6f4
+    style PAYLOAD   fill:#1e1e2e,stroke:#f9e2af,stroke-width:1px,color:#cdd6f4
+    style PRETRANS  fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
+    style EMBED     fill:#1e1e2e,stroke:#89b4fa,stroke-width:2px,color:#cdd6f4
+    style XOR_ENC   fill:#181825,stroke:#f38ba8,stroke-width:3px,color:#cdd6f4
+    style FOUT      fill:#002200,stroke:#a6e3a1,stroke-width:3px,color:#a6e3a1
+    style XOR_DEC   fill:#181825,stroke:#f38ba8,stroke-width:3px,color:#cdd6f4
+    style EXTRACT   fill:#1e1e2e,stroke:#89dceb,stroke-width:2px,color:#cdd6f4
+    style RESTORE   fill:#1e1e2e,stroke:#89dceb,stroke-width:2px,color:#cdd6f4
+    style KD_DEC    fill:#1e1e2e,stroke:#f38ba8,stroke-width:2px,color:#cdd6f4
+    style RES       fill:#002200,stroke:#a6e3a1,stroke-width:3px,color:#a6e3a1
 ```
-
----
-
-## Bit-Level Embedding Diagram
-
-This shows **which bits are used at each step** for a single triangular face with k=4 (n≤16 vertices):
-
-```
-Face F'ᵢ = (v'¹, v'², v'³)  after RCS, before encryption
-           [Index 1]  [Index 2]  [Index 3]
-
-           b₄b₃b₂b₁  b₄b₃b₂b₁  b₄b₃b₂b₁   ← binary bits (LSB = b₁)
-           ─────────────────────────────────
-           If L¹=2, EC¹=3:
-           [?][?][?][1]  ← bits b₁,b₂,b₃ = MODIFIABLE (green ✓)
-                          bit  b₄         = FIXED (orange ✗)
-
-           If L²=1, EC²=2:
-                     [?][?][1][·]  ← bits b₁,b₂ = MODIFIABLE
-                                     bits b₃,b₄  = FIXED
-
-           If L³=0, EC³=1:
-                               [?][1][·][·]  ← bit b₁ = MODIFIABLE
-                                               bits b₂,b₃,b₄ = FIXED
-
-Step F (Aux Info): fills modifiable bits of Index 1 first (vertical across all faces)
-Step G (Message):  fills remaining modifiable bits of Index 2 and Index 3
-
-Embedding order within each index:  b₁ → b₂ → b₃ → ... → b_{EC}
-The (EC+1)-th bit is always '1' — this is the structural anchor for recovery.
-```
-
----
-
-## How "Index Shifting" Works (Analogy to Image RDH)
-
-In image-domain RDH, pixel *intensity values* are shifted to create space for embedding.
-In this paper, **vertex index values** play the same role:
-
-| Image RDH | This Paper (3D Mesh) |
-|-----------|----------------------|
-| Pixel intensity histogram | Vertex index value distribution |
-| Histogram bin shift | LZC / mMSB label (measures index difference) |
-| Peak bin P | First-index reference v'¹ᵢ₋₁ |
-| Zero bin Z | Bin where difference = 0 (L = k) |
-| Shift pixels above P up by 1 | Encrypted index adjusted by Eq.3 |
-| Embed 0/1 at peak pixels | Embed bits in first L modifiable positions |
-| Eq.1 in image papers | **Eq.1 here**: L¹ᵢ = LZC(v'¹ᵢ − v'¹ᵢ₋₁) |
-
-The key insight: instead of shifting a 2D histogram of pixel intensities, this method
-shifts the **leading-zero structure** of the binary difference between consecutive face indices.
 
 ---
 
 ## Key Equations Reference
 
-| Eq. | Formula | Used In |
-|-----|---------|---------|
-| **Eq. 1** | `L¹ᵢ = LZC(v'¹ᵢ − v'¹ᵢ₋₁)` | 1st index label for all faces |
-| **Eq. 2** | `Lᵗᵢ = LZC(v'ᵗᵢ − v'¹ᵢ), t=2,3` | 2nd/3rd index labels for HoP faces |
-| **Eq. 3** | Range-preserving XOR (see diagram above) | Face encryption |
-| **EC formula** | `ECᵗᵢ = min(k, Lᵗᵢ + 1)` | Bits embeddable per index |
-| **Di** | `max(F'ᵢ) − min(F'ᵢ) ≤ T` | HoP/HeP classification condition |
+| Eq. | Formula | Step |
+|-----|---------|------|
+| **Eq. 1** | `L¹ᵢ = LZC(v'¹ᵢ − ref¹ᵢ)` where ref=0 (i=1), 2ᵏ (i=p), v'¹ᵢ₋₁ (else) | Step C — 1st index label |
+| **Eq. 2** | `Lᵗᵢ = LZC(v'ᵗᵢ − v'¹ᵢ)`, t=2,3 | Step C — HoP 2nd/3rd labels |
+| **Eq. 3** | Range-preserving XOR: `e' = v XOR rnd`, then modular wrap if out of region | Step E — Encryption |
+| **EC**    | `ECᵗᵢ = min(k, Lᵗᵢ + 1)` — L free bits + 1 structural bit | Step C |
+| **k**     | `k = ⌊log₂ n⌋` — **floor** not ceil | Global |
+| **Di**    | `Dᵢ = max(F'ᵢ) − min(F'ᵢ) ≤ T  AND  same region → HoP` | Step B |
+| **d**     | `d = v − ref ≥ 0` when LZC, L>0; `e_val=v` when L=0 or mMSB | Step E — pre-transform |
 
 ---
 
-## Results Summary
+## How "Index Shifting" Relates to Image RDH
 
-| Metric | Value |
-|--------|-------|
-| Avg embedding capacity (T=10) | **32.63 bpp** |
-| Avg embedding capacity (T=1000) | **33.71 bpp** |
-| Best prior method (Sui [17]) | 28.00 bpv |
-| 1st index contribution | 16.21 bpp (constant, independent of T) |
-| Vertex coordinates modified | **None** |
-| Reversibility | **Perfect** (lossless recovery) |
+| Image RDH | This Paper (3D Mesh) |
+|-----------|----------------------|
+| Pixel intensity histogram | Vertex index value distribution |
+| Histogram bin shift | LZC / mMSB label (difference leading zeros) |
+| Peak bin P | First-index reference `v'¹ᵢ₋₁` |
+| Shift pixels above P by 1 | Encrypted index adjusted by Eq. 3 |
+| Embed 0/1 at peak pixels | Embed bits in MSB positions 1…L |
+
+---
+
+## Results (Paper Table VIII, T=10)
+
+| Model | Faces | HoP% | BPP |
+|-------|-------|------|-----|
+| Bunny | 69,451 | 41.82% | 32.63 |
+| Dragon | 202,520 | 5.21% | 31.44 |
+| HappyBuddha | 543,652 | 7.31% | 31.72 |
+| Teeth | 10,010 | 30.11% | 33.91 |
+| **Average (20 models)** | — | — | **32.63** |
+
+Best prior method (Sui [17]): **28.00 bpv** — this paper improves by **+16%**
 
 ---
 
@@ -137,32 +183,29 @@ cd 'c:\iiitvd\New Paper 19.05.2026\RDH_PolyFace_Matlab'
 RDH_PolyFace
 ```
 
-Expected output:
+Expected:
 ```
 === RDH in Encrypted Polygonal Faces (Tsai, IEEE TMM 2025) ===
-Model:    Bunny (synthetic)
-Vertices: 1000  |  Faces: 2000  |  n=1000  k=10  T=10
-Message: 500 bits
+Vertices: 200 | Faces: 400 | n=200 | k=7 | 2^k=128 | T=10
+RE1=[0,127]  RE2=[128,199]
+Message: 200 bits
 --- EMBEDDING ---
-Auxiliary info: XXX bits
-Total embedding capacity: XXXX bits (XX.XX bpp)
-Message embedded: 500 bits
 --- EXTRACTION & DECRYPTION ---
-Message recovery:  PASS
-Face restoration:  PASS
+Message recovery:  PASS ✓
+Face restoration:  PASS ✓
 ```
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `RDH_PolyFace.m` | Complete MATLAB R2025b implementation (single file) |
-| `RDH_PolyFace_Demo_Report.md` | Full demo report (CE-MRIMR template format) |
+| `RDH_PolyFace.m` | Complete MATLAB implementation v4 (single file, no extra toolbox needed) |
+| `RDH_PolyFace_Demo_Report.md` | Full demo report (CE-MRIMR template) |
 | `README.md` | This file — pipeline diagram + equations |
 
 ## Requirements
 
-- MATLAB R2025b
-- Statistics and Machine Learning Toolbox (for `huffmandict`; fallback included)
+- MATLAB R2025b+
+- Statistics Toolbox optional (Huffman; fallback with `dec2bin` included)
 - No Image Processing Toolbox needed
 - No GPU required
