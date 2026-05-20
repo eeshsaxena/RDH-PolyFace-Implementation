@@ -71,12 +71,17 @@ function RDH_PolyFace()
     % EC per index
     [EC1, EC2, EC3] = compute_EC(L1, L2, L3, k);
 
-    % Step E: Pre-transform + embed msg into pre-encrypted values + XOR encrypt
-    %   Note: embedding happens into pre-encrypted d (for LZC) BEFORE XOR
+    % KD-encrypt message BEFORE setting KE seed (critical: keeps rng states separate)
+    rng(KD);
+    kd_enc_stream = randi([0 1], 1, numel(msg_bits), 'int32');
+    msg_enc = xor(msg_bits, kd_enc_stream);   % KD-encrypted message
+
+    % Step E+F+G: Pre-transform + embed payload + XOR encrypt (KE seed)
+    rec_flat = int32(reshape(rec_info(:,1:3)', 1, []));  % is_hop,pred_L2,pred_L3 per face
+    payload  = [int32(aux_bits), rec_flat, msg_enc];     % full payload to embed
     rng(KE);
-    [F_enc, rnd_stream] = face_encrypt_with_embed(...
-        F_rcs, n, k, L1, L2, L3, rec_info, refs, EC1, EC2, EC3, ...
-        aux_bits, rec_info, msg_bits, KD);
+    F_enc = face_encrypt_with_embed(...
+        F_rcs, n, k, L1, L2, L3, rec_info, refs, payload);
 
     total_cap = sum(double(EC1)-1) + sum(double(EC2)-1) + sum(double(EC3)-1);
     bpp = (sum(double(EC1)) + sum(double(EC2)) + sum(double(EC3))) / nf;
@@ -86,11 +91,13 @@ function RDH_PolyFace()
     % ===== EXTRACTION SIDE =====
     fprintf('--- EXTRACTION & DECRYPTION ---\n');
 
-    % Step H: XOR decrypt, apply LZC/mMSB inverse, recover original faces
+    % Step H: XOR decrypt (KE), apply LZC/mMSB inverse, recover original faces
+    % Then KD-decrypt to recover message.
+    % rng(KE) restores the same KE stream used during encryption.
     rng(KE);
     [msg_dec, F_dec] = face_decrypt_and_extract(...
-        F_enc, n, k, L1, L2, L3, rec_info, refs, EC1, EC2, EC3, ...
-        numel(aux_bits), numel(msg_bits), KD);
+        F_enc, n, k, L1, L2, L3, rec_info, refs, ...
+        numel(aux_bits), numel(rec_flat), numel(msg_enc), KD);
 
     % Verify
     match_msg   = isequal(msg_dec,   msg_bits(1:numel(msg_dec)));
@@ -203,15 +210,15 @@ end
 
 % ---------- LZC helper ----------
 function z = lzc_k(d, k)
-    % Count leading zeros of non-negative integer d in k-bit representation.
-    % Returns 0 if d<0 or d>=2^k (no leading zeros).
+    % Count leading zeros of non-negative integer d in k-bit MSB-first representation.
+    % Returns 0 if d<0 or d>=2^k (no leading zeros). Uses dec2bin (no toolbox needed).
     if d < 0 || d >= 2^k
         z = 0; return;
     end
     if d == 0
         z = k; return;
     end
-    b = de2bi(d, k, 'left-msb');   % MSB-first bit array
+    b = dec2bin(d, k) - '0';   % MSB-first: dec2bin always returns MSB first
     first1 = find(b, 1, 'first');
     z = first1 - 1;
 end
@@ -247,17 +254,18 @@ function ok = same_region(v1, v2, k)
 end
 
 function lbl = mmsb_label(vp, vr, k, n)
-    % Count matching bits from MSB (excluding first bit for RE2).
+    % Count matching bits from MSB (paper: k-bit for RE1, k+1-bit for RE2).
+    % Uses dec2bin (no Communications Toolbox required).
     if vr < 2^k
-        bp = de2bi(vp, k, 'left-msb');
-        br = de2bi(vr, k, 'left-msb');
+        bp = dec2bin(vp, k) - '0';     % MSB-first, k bits
+        br = dec2bin(vr, k) - '0';
         start = 1;
     else
-        bp = de2bi(vp, k+1, 'left-msb');
-        br = de2bi(vr, k+1, 'left-msb');
-        bp(1) = double(vp >= n);
+        bp = dec2bin(vp, k+1) - '0';   % MSB-first, k+1 bits
+        br = dec2bin(vr, k+1) - '0';
+        bp(1) = double(vp >= n);        % MSB = indicator bit
         br(1) = double(vr >= n);
-        start = 2;   % skip MSB indicator
+        start = 2;                      % compare from 2nd bit (skip indicator)
     end
     lbl = 0;
     for b = start:numel(bp)
@@ -291,12 +299,12 @@ function [tree, enc] = huffman_encode(labels)
         enc  = huffmanenco(vals, dict);
         tree.syms = uv; tree.dict = dict;
     catch
-        % Fallback fixed-length
+        % Fallback fixed-length (no toolbox)
         nb = ceil(log2(numel(uv)+1));
         codes = cell(1, numel(uv));
         [~,ord] = sort(freq,'descend');
         for ii = 1:numel(uv)
-            codes{ord(ii)} = de2bi(ii-1, nb, 'left-msb');
+            codes{ord(ii)} = dec2bin(ii-1, nb) - '0';  % MSB-first, no toolbox
         end
         tree.syms = uv; tree.codes = codes;
         enc = [];
@@ -308,101 +316,81 @@ function [tree, enc] = huffman_encode(labels)
 end
 
 function bits = serialize_tree(tree)
+    % Serialize Huffman tree symbol list as fixed-width bits (MSB-first, no toolbox).
     bits = [];
     if ~isfield(tree,'syms') || isempty(tree.syms), return; end
     for s = tree.syms
-        bits = [bits, de2bi(s+256, 10, 'left-msb')]; %#ok<AGROW>
+        bits = [bits, dec2bin(s+256, 10) - '0']; %#ok<AGROW>  % 10-bit MSB-first
     end
 end
 
 % ==========================================================================
 % E+F+G (combined).
 % For each face/index:
-%   1. Compute pre-encrypted value:
-%      - LZC index: e_val = d = v - ref  (d+2^k if v in RE2 and ref=2^k)
-%      - mMSB index: e_val = v
-%   2. Embed payload (aux_bits then msg_bits) into MSB leading-zero positions
-%      of e_val (bits k, k-1, ..., k-L+1 in MATLAB notation = PAPER positions 1..L)
-%   3. XOR encrypt with KE stream (range-preserving Eq.3)
+%   1. If LZC and L>0: e_val = d=v-ref (leading zeros carry payload bits)
+%      If LZC and L=0 OR mMSB: e_val = v (no pre-transform)
+%   2. Embed payload into MSB leading-zero positions 1..L of e_val
+%      Structural bit at paper position L+1 forced to 1 (only if L>0)
+%   3. XOR encrypt e_val (range-preserving Eq.3) using KE rng stream
 % ==========================================================================
-function [F_out, rnd_stream] = face_encrypt_with_embed(...
-        F_rcs, n, k, L1, L2, L3, rec_info, refs, EC1, EC2, EC3, ...
-        aux_bits, rec_info2, msg_bits, KD)
+function F_out = face_encrypt_with_embed(...
+        F_rcs, n, k, L1, L2, L3, rec_info, refs, payload)
 
-    Nf = size(F_rcs, 1);
-    F_out = F_rcs;
-
-    % Prepare full payload: aux_bits | rec_info (flattened) | KD-encrypted msg
-    rng(KD);
-    kd_stream = randi([0 1], 1, numel(msg_bits), 'int32');
-    msg_enc   = xor(msg_bits, kd_stream);
-    rec_flat  = reshape(rec_info2(:,1:3)', 1, []);   % is_hop, pred_L2, pred_L3 per face
-    payload   = [int32(aux_bits), int32(rec_flat), msg_enc];
-
-    pay_ptr   = 1;
-    rnd_stream = [];   % store random bits in order (for decryption)
+    Nf      = size(F_rcs, 1);
+    F_out   = F_rcs;
+    pay_ptr = 1;
 
     for i = 1:Nf
-        v   = double(F_rcs(i,:));
-        EC  = [double(EC1(i)), double(EC2(i)), double(EC3(i))];
-        Lv  = [double(L1(i)), double(L2(i)), double(L3(i))];
-        ref = refs(i,:);
+        v    = double(F_rcs(i,:));
+        Lv   = [double(L1(i)), double(L2(i)), double(L3(i))];
+        ref  = refs(i,:);
         pred = [0, double(rec_info(i,2)), double(rec_info(i,3))]; % 0=LZC,1=mMSB
 
         for t = 1:3
-            % --- Pre-encrypt transform ---
-            if pred(t) == 0  % LZC: substitute d = v-ref
-                d = v(t) - ref(t);
-                if v(t) >= 2^k && ref(t) == 2^k
-                    % p-th face first index: d = v-2^k (in RE1 range)
-                    e_val = d;
-                elseif v(t) >= 2^k
-                    % RE2 original, ref also RE2: d might need 2^k offset
-                    e_val = d;
-                else
-                    e_val = d;   % RE1: d=v-ref in [0,2^k-1]
-                end
-                if e_val < 0, e_val = 0; end   % guard for edge case
-            else             % mMSB: use original value
-                e_val = v(t);
+            L_bits = Lv(t);  % leading zeros = free embedding positions
+
+            % --- Pre-encrypt transform (paper Sec.III-E) ---
+            % LZC with L>0: substitute d = v-ref (d has L leading zeros by construction)
+            % LZC with L=0: keep v (no positive difference with leading zeros)
+            % mMSB:         keep v (prediction based on absolute value)
+            if pred(t) == 0 && L_bits > 0
+                e_val = v(t) - ref(t);   % d = v - ref  (always >= 0 when L>0)
+            else
+                e_val = v(t);            % use v directly
             end
 
-            % --- Embed payload into leading-zero MSB positions of e_val ---
-            % Paper positions 1..L (MSB-first) = MATLAB bits k, k-1, ..., k-L+1
-            L_bits = Lv(t);   % number of free leading-zero positions = L
+            % --- Embed payload into MSB leading-zero positions ---
+            % Paper positions 1..L_bits (MSB-first) = MATLAB bits k, k-1, ..., k-L+1
             for b_paper = 1:L_bits
-                matlab_bit = k - b_paper + 1;   % convert paper pos -> MATLAB bit
-                if matlab_bit < 1, break; end
                 if pay_ptr > numel(payload), break; end
                 e_val = set_msb_bit(e_val, k, b_paper, double(payload(pay_ptr)));
                 pay_ptr = pay_ptr + 1;
             end
-            % Structural bit (paper position L+1 = MATLAB bit k-L) forced to 1
-            if L_bits >= 0 && (k - L_bits) >= 1
+            % Structural '1' bit at paper position L+1 (only when L>0)
+            if L_bits > 0 && (k - L_bits) >= 1
                 e_val = set_msb_bit(e_val, k, L_bits+1, 1);
             end
 
-            % --- XOR encrypt (Eq.3 range-preserving) ---
-            if v(t) < 2^k   % RE1: k-bit XOR
+            % --- XOR encrypt (Eq.3) — nbits based on e_val's region ---
+            % LZC: e_val=d always in RE1 → k-bit; mMSB L=0: e_val=v, use v's region
+            if e_val < 2^k
                 nbits = k;
-            else             % RE2: (k+1)-bit XOR
+            else
                 nbits = k+1;
             end
             rnd_val = randi([0, 2^nbits-1]);
-            rnd_stream(end+1) = rnd_val; %#ok<AGROW>
-            e_enc = bitxor(uint32(round(e_val)), uint32(rnd_val));
+            e_enc   = double(bitxor(uint64(round(e_val)), uint64(rnd_val)));
 
-            % Range-preserving adjustment (Eq.3)
-            e_enc = double(e_enc);
-            if v(t) < 2^k    % result must stay in RE1
+            % Range-preserving adjustment (Eq.3) based on e_val's region
+            if e_val < 2^k       % keep in RE1 [0, 2^k-1]
                 if e_enc >= 2^k
                     e_enc = mod(e_enc, 2^k);
                 end
-            else              % result must stay in RE2
+            else                  % keep in RE2 [2^k, n-1]
                 if e_enc >= n
-                    e_enc = 2^k + mod(e_enc - 2^k, max(n - 2^k, 1));
+                    e_enc = 2^k + mod(e_enc - 2^k, max(n-2^k,1));
                 elseif e_enc < 2^k
-                    e_enc = 2^k + mod(e_enc + 2^k, max(n - 2^k, 1));
+                    e_enc = 2^k + mod(e_enc + 2^k, max(n-2^k,1));
                 end
             end
 
@@ -413,88 +401,81 @@ end
 
 % ==========================================================================
 % H. Decryption + Extraction (receiver side)
-%   1. For each face/index: XOR decrypt (KE stream, same order)
-%   2. Read payload bits from MSB positions 1..L
-%   3. Apply LZC/mMSB inverse to recover d or v
-%   4. For LZC: v = d + ref
+%   Same KE rng order as encryption → XOR cancels perfectly.
+%   1. XOR decrypt each index value
+%   2. Extract payload bits from MSB positions 1..L
+%   3. Reverse LZC/mMSB (clear leading bits, restore structural) → recover d or v
+%   4. For LZC (L>0): v = d + ref.  For L=0 or mMSB: v = e_dec directly.
 % ==========================================================================
 function [msg_dec, F_dec] = face_decrypt_and_extract(...
-        F_enc, n, k, L1, L2, L3, rec_info, refs, EC1, EC2, EC3, ...
-        aux_len, msg_len, KD)
+        F_enc, n, k, L1, L2, L3, rec_info, refs, ...
+        aux_len, rec_len, msg_len, KD)
 
-    Nf     = size(F_enc, 1);
-    F_dec  = F_enc;
+    Nf          = size(F_enc, 1);
+    F_dec       = F_enc;
     all_payload = [];
 
     for i = 1:Nf
-        v_enc  = double(F_enc(i,:));
-        Lv     = [double(L1(i)), double(L2(i)), double(L3(i))];
-        orig_v = double(F_enc(i,:));  % original encrypted (before embedding, approx)
-        ref    = refs(i,:);
-        pred   = [0, double(rec_info(i,2)), double(rec_info(i,3))];
+        v_enc = double(F_enc(i,:));
+        Lv    = [double(L1(i)), double(L2(i)), double(L3(i))];
+        ref   = refs(i,:);
+        pred  = [0, double(rec_info(i,2)), double(rec_info(i,3))];
 
         for t = 1:3
-            e_enc = v_enc(t);
+            e_enc   = v_enc(t);
+            L_bits  = Lv(t);
 
-            % Determine XOR width (based on ORIGINAL region)
-            % We use ref region to infer: if ref is RE2 and pred=mMSB then v is RE2
-            if ref(t) >= 2^k
-                nbits = k+1;
+            % XOR width matches encryption:
+            %   LZC L>0: e_val=d always RE1 → k-bit
+            %   LZC L=0 or mMSB: e_val=v; use ref region as proxy for v's region
+            if pred(t) == 0 && L_bits > 0
+                nbits = k;              % LZC with valid d: always RE1
+            elseif ref(t) >= 2^k
+                nbits = k+1;           % mMSB or LZC-L=0 in RE2
             else
-                nbits = k;
+                nbits = k;             % mMSB or LZC-L=0 in RE1
             end
             rnd_val = randi([0, 2^nbits-1]);
 
-            % --- Step 1: XOR decrypt ---
-            e_dec = double(bitxor(uint32(round(e_enc)), uint32(rnd_val)));
+            % Step 1: XOR decrypt (self-inverse with same key+order)
+            e_dec = double(bitxor(uint64(round(e_enc)), uint64(rnd_val)));
 
-            % Reverse range-preserving (Eq.3 inverse)
-            % (The XOR is its own inverse: XOR twice with same rnd gives original)
-            % e_dec is now the embedded pre-encrypted value
-
-            % --- Step 2: Extract payload from MSB positions 1..L ---
-            L_bits = Lv(t);
+            % Step 2: Extract payload from MSB positions 1..L
             for b_paper = 1:L_bits
-                bit_val = get_msb_bit(e_dec, k, b_paper);
-                all_payload(end+1) = bit_val; %#ok<AGROW>
+                all_payload(end+1) = get_msb_bit(e_dec, k, b_paper); %#ok<AGROW>
             end
 
-            % --- Step 3: LZC/mMSB inverse → recover e_val (pre-embedded) ---
-            % Clear top L bits (positions 1..L in paper = MATLAB bits k..k-L+1)
+            % Step 3: Reverse leading-zero positions (only when L>0)
             for b_paper = 1:L_bits
-                e_dec = set_msb_bit(e_dec, k, b_paper, 0);
+                e_dec = set_msb_bit(e_dec, k, b_paper, 0);  % clear payload bits
             end
-            % Set structural bit (position L+1 in paper = MATLAB bit k-L) to 1
-            if L_bits >= 0 && (k - L_bits) >= 1
+            if L_bits > 0 && (k - L_bits) >= 1              % restore structural '1'
                 e_dec = set_msb_bit(e_dec, k, L_bits+1, 1);
             end
 
-            % Now e_dec = the pre-encrypted d (for LZC) or v (for mMSB)
-            if pred(t) == 0   % LZC: recovered value is d, add ref
-                d_rec = e_dec;
-                v_rec = d_rec + ref(t);
-                % Clamp to valid range
-                v_rec = max(0, min(n-1, round(v_rec)));
-            else              % mMSB: recovered value is v directly
+            % Step 4: Recover original index
+            if pred(t) == 0 && L_bits > 0
+                % LZC with valid transform: e_dec = d, add reference
+                v_rec = e_dec + ref(t);
+            else
+                % LZC L=0 (no-op) or mMSB: e_dec = v directly
                 v_rec = e_dec;
-                v_rec = max(0, min(n-1, round(v_rec)));
             end
-
+            v_rec = max(0, min(n-1, round(v_rec)));
             F_dec(i,t) = int32(v_rec);
         end
     end
 
-    % Extract message from payload
-    rec_len = 3 * Nf;   % rec_info bits (is_hop, pred_L2, pred_L3 per face)
+    % Extract message from payload stream
     msg_start = aux_len + rec_len + 1;
     if numel(all_payload) >= msg_start + msg_len - 1
         msg_enc = int32(all_payload(msg_start : msg_start + msg_len - 1));
     else
-        avail = max(0, numel(all_payload) - msg_start + 1);
+        avail   = max(0, numel(all_payload) - msg_start + 1);
         msg_enc = int32(all_payload(msg_start : msg_start + avail - 1));
     end
 
-    % KD decrypt
+    % KD-decrypt message
     rng(KD);
     kd_stream = randi([0 1], 1, numel(msg_enc), 'int32');
     msg_dec   = xor(msg_enc, kd_stream);
